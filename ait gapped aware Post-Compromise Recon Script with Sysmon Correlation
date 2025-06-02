@@ -1,0 +1,98 @@
+# ========================================
+# Post-Compromise Recon Script with Sysmon Correlation
+# Author: Xenoz - Air-Gap Aware | Version: Final
+# ========================================
+
+$report = "$env:USERPROFILE\Desktop\airgap_sysmon_report.txt"
+function Log($msg) {
+    $t = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $report -Value "[$t] $msg"
+    Write-Host $msg
+}
+
+Log "[1] Checking for Sysmon operational log"
+$sysmonLog = "Microsoft-Windows-Sysmon/Operational"
+$sysmonAvailable = Get-WinEvent -ListLog $sysmonLog -ErrorAction SilentlyContinue
+if (-not $sysmonAvailable) {
+    Log "Sysmon log not available. Skipping correlation."
+} else {
+
+    Log "[2] Process Execution (Sysmon ID 1)"
+    try {
+        $proc = Get-WinEvent -FilterHashtable @{LogName=$sysmonLog; ID=1} -MaxEvents 10
+        foreach ($e in $proc) {
+            Log "Process: $($e.TimeCreated) - $($e.Message)"
+        }
+    } catch { Log "No recent Sysmon process creation events." }
+
+    Log "[3] Network Connections (Sysmon ID 3)"
+    try {
+        $net = Get-WinEvent -FilterHashtable @{LogName=$sysmonLog; ID=3} -MaxEvents 10
+        foreach ($n in $net) {
+            if ($n.Message -match "239.255.255.250|224.0.0.251|ff02::1") {
+                Log "Suspicious multicast traffic: $($n.TimeCreated) - $($n.Message)"
+            }
+        }
+    } catch { Log "No recent Sysmon network events." }
+
+    Log "[4] Image Load Anomalies (Sysmon ID 7)"
+    try {
+        $img = Get-WinEvent -FilterHashtable @{LogName=$sysmonLog; ID=7} -MaxEvents 10
+        foreach ($i in $img) {
+            if ($i.Message -notmatch "C:\\Windows\\") {
+                Log "Unusual DLL loaded: $($i.TimeCreated) - $($i.Message)"
+            }
+        }
+    } catch { Log "No image load anomalies found." }
+
+    Log "[5] Pipe Creation and WMI Use (Sysmon ID 17/18)"
+    try {
+        $pipes = Get-WinEvent -FilterHashtable @{LogName=$sysmonLog; ID=17} -MaxEvents 5
+        foreach ($p in $pipes) {
+            Log "Pipe Event: $($p.TimeCreated) - $($p.Message)"
+        }
+    } catch { Log "No pipe-related events detected." }
+}
+
+Log "[6] Scheduled Tasks outside Microsoft path"
+$tasks = Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\Microsoft*' }
+foreach ($t in $tasks) {
+    Log "Task: $($t.TaskName) | Path: $($t.TaskPath)"
+}
+
+Log "[7] Registry Autoruns"
+$runKeys = @(
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+)
+foreach ($key in $runKeys) {
+    try {
+        Get-ItemProperty -Path $key | ForEach-Object {
+            $_.PSObject.Properties | ForEach-Object {
+                Log "RunKey: $key -> $($_.Name) = $($_.Value)"
+            }
+        }
+    } catch {
+        Log "Registry key $key inaccessible"
+    }
+}
+
+Log "[8] Shadow Copy Check"
+$vss = (vssadmin list shadows) -join "`n"
+if ($vss -match "GLOBALROOT") {
+    Log "Shadow copies present"
+} else {
+    Log "No shadow copies found or deleted"
+}
+
+Log "[9] Firewall multicast traces (SSDP/mDNS/ICMPv6)"
+$fwlog = "C:\Windows\System32\LogFiles\Firewall\pfirewall.log"
+if (Test-Path $fwlog) {
+    Get-Content $fwlog | Select-String "239.255.255.250|224.0.0.251|ff02::1" | ForEach-Object {
+        Log "Firewall multicast trace: $_"
+    }
+} else {
+    Log "Firewall log not found or logging disabled"
+}
+
+Log "[10] Report completed at $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")"
